@@ -1,0 +1,415 @@
+#!/usr/bin/perl
+
+# 2780 RJE simulation program
+#   Version 1.0.
+#   Written 2 Nov. 2020 by G. Helffrich.
+
+# Developed with simh / IBM360 running HASP II under MTS.
+# simh 2703 emulation provides a TCP listening port, 2780, for RJE connections.
+# Quirks associated with simh terminal multiplexer lead to failure to connect one
+# time after each job is sent.  Try again to either send or receive a new job
+# after the failure.
+
+use strict;
+use warnings;
+use FileHandle;
+use Socket;
+use IO::Socket::INET;
+use Encode "from_to";
+
+# 2780 HASP II carriage control chars:
+# ESC / - single space  ESC B - skip to chan. 2  ESC F - skip to chan. 6
+# ESC S - double space  ESC C - skip to chan. 3  ESC G - skip to chan. 7
+# ESC T - triple space  ESC D - skip to chan. 4  ESC H - skip to chan. 8
+# ESC A - chan. 1 skip  ESC E - skip to chan. 5
+
+# HASP II / MTS carriage control tape: 66 lines (1-66).
+# A - top of logical page (line 4)
+# C - bottom of physical page (line 66)
+# H - top of physical page (line 1)
+# B, D-G - unused
+# Format xx:y means punch in tape channel y (A-H) at line xx (0-65)
+my $ccdesc = '0:H,3:A,65:C';
+
+my $NUL = chr(0x00);
+my $SOH = chr(0x01);
+my $STX = chr(0x02);
+my $ETX = chr(0x03);
+my $HT  = chr(0x05);
+my $DLE = chr(0x10);
+my $NL  = chr(0x15);
+my $EOM = chr(0x19);
+my $IBC = chr(0x1f);
+my $RVI = chr(0x24);  # reassignment of 2741 BYP
+my $ETB = chr(0x26);
+my $ESC = chr(0x27);
+my $ENQ = chr(0x2d);
+my $SYN = chr(0x32);
+my $EOT = chr(0x37);
+my $NAK = chr(0x3d);
+my $SP  = chr(0x40);
+my $ACK0 = chr(0x61);
+my $ACK1 = chr(0x70);
+
+## Routines control tape skip point structure
+my @cct;
+for my $i (0..65) {
+   $cct[$i] = {A=>-1, B=>-1, C=>-1, D=>-1, E=>-1, F=>-1, G=>-1, H=>-1}
+}
+sub cctpr {
+   ## Dump (for debugging purposes) printer control tape
+   for my $i (0..65) {
+      printf "%2d A:%2d B:%2d C:%2d D:%2d E:%2d F:%2d G:%2d H:%2d\n",$i,
+      $cct[$i]{"A"}, $cct[$i]{"B"}, $cct[$i]{"C"}, $cct[$i]{"D"},
+      $cct[$i]{"E"}, $cct[$i]{"F"}, $cct[$i]{"G"}, $cct[$i]{"H"};
+   }
+}
+sub cctmk {
+   ## Make table of end lines for each skip-to-channel at each source line
+   my $dbg = 0;
+   for my $ent (split /,/,$_[0]) {
+      my ($ln,$ch) = split /:/,$ent or die "**Bad CC tape spec.";
+      $ln = 66 if $ln <= 0;
+      for my $i (0 .. $ln-1) { $cct[$i]{$ch} = $ln if $cct[$i]{$ch} == -1 }
+   }
+   cctpr() if $dbg; ## debug
+   for my $ent (split /,/,"A,B,C,D,E,F,G,H") {
+      my $i;
+      for($i=0;$i<66;$i++) { last if $cct[$i]{$ent} < 0 }
+      if ($i == 0) {
+         for $i (0..65) { $cct[$i]{$ent} = $i+1 } ## Undefined skip, single space
+      } else {
+         my $n = $cct[$i-1]{$ent}+66;
+         for my $k ($i..65) { $cct[$k]{$ent} = $n } ## Skip to posn. on next page
+      }
+   }
+   cctpr() if $dbg; ## debug
+}
+cctmk($ccdesc);
+
+sub usage {
+   my $ver = '$Format:%ct$ ($Format:%h$)';  ## git commit ID, date
+   my $pro = "usage: $0 {-r | -s} [-h] [-# <n>] [-p <file>] [{-cc | -d}] <port>";
+
+   print "\n";
+   print "$pro\n";
+   print "\n";
+   print pad("Version $ver",length($pro),'L') . "\n";
+   print "\n";
+   print "Simulates IBM 2780 RJE device attached to a simulated 2703 using\n";
+   print "BSC protocol.  Assumes that HASP provides the RJE service.\n";
+   print "Use -s to send the input deck, -r to retrieve printed output.\n";
+   print "Assumes 66 line output page length.\n";
+   print "Use -p <file> with -r to put punched card output (EBCDIC) into\n";
+   print "the specified <file>.\n";
+   print "\n";
+   print "<port> is the RJE TCP listener (usually specified as localhost:2780).\n";
+   print "\n";
+   print "Use -# <n> to provide an explicit job number if multiple simultaneous\n";
+   print "jobs are active.\n";
+   print "\n";
+   print "-d and -cc are debug options to view the raw output byte stream and\n";
+   print "carriage control in the print stream.\n";
+   print "\n";
+   print "-h prints this help.\n";
+   print "\n";
+}
+
+#------------------------------------------------------------------------------
+# Process command line args
+
+my ($ccd, $dbg)  = (0,0);
+my ($arg, $sock, $mode);
+my $spec = '<missing>';
+my $s8num = 600001;
+my $pfile;
+
+ARG: while (@ARGV > 0) {
+   $arg = shift @ARGV;
+   if ($arg eq '-cc'){ $ccd = 1; next ARG;}      ## carriage control debug
+   if ($arg eq '-d') { $dbg = 1; next ARG;}      ## dump byte stream
+   if ($arg eq '-s') { $mode = "SEND"; next ARG;}## send job
+   if ($arg eq '-r') { $mode = "RECV"; next ARG;}## receive job
+   if ($arg eq '-#') {                           ## explicit job number
+      $s8num = 0 + shift @ARGV or die "**Bad s8 number";
+      next ARG;
+   }
+   if ($arg eq '-p') {                           ## punch card output file
+      my $fn = shift @ARGV or die "**Missing punch file";
+      $pfile = FileHandle->new("> $fn") or die "**Bad punch file name";
+      next ARG;
+   }
+   if ($arg =~ /^[^-]/) {                        ## connection
+      $spec = $arg;
+      $sock = IO::Socket::INET->new(PeerAddr => $arg, ReuseAddr => 1);
+      next ARG;
+   }
+   if ($arg eq '-h') { usage(); next ARG}
+   die "**Bad arg: " . $arg . "\n";
+}
+die "**No action specified (neither -r nor -s)" unless $mode;
+die "**-p option Doesn't make sense with -s"
+   if $mode eq 'SEND' && defined $pfile;
+
+die "Failed to connect to socket $spec: $!\n"
+   unless defined($sock);
+
+#------------------------------------------------------------------------------
+# Utility routines
+
+sub pad {
+   ## Right or left pad string to specified length
+   ## pad(string, length [, {R|L} [, char]])
+   my ($s, $max_length, $dir, $pad_char) = @_;
+   $dir = 'R' unless defined($dir);
+
+   my $pad_string = (defined $pad_char ? $pad_char : ' ' )
+                  x ($max_length - length $s);
+   return $dir eq 'R' ? $s . $pad_string : $pad_string . $s;
+}
+
+sub atoe {
+   ## ASCII to EBCDIC translation
+   my $str = $_[0];
+   from_to($str,"latin1","cp1047");
+   return $str;
+}
+
+sub etoa {
+   ## EBCDIC to ASCII translation
+   my $str = $_[0];
+   from_to($str,"cp1047","latin1");
+   return $str;
+}
+
+sub deck {
+   ## HASP S-8 DECK card given job number
+   my $num = $_[0];
+   my $s8c = 'X               ';
+   $s8c .= '  ' .  sprintf("%06d",$_[0]) . '        ';
+   $s8c .= '       DECK     ';
+   $s8c .= '                ';
+   $s8c .= '        ' . sprintf("%06d",$_[0]) . ' .';
+   die "***Bad S-8 card format" unless length($s8c) == 80;
+   return chr(0xe0) . atoe(substr($s8c,1,79));
+}
+
+sub put {
+   ## Put byte string onto output socket.
+   $sock->send($_[0]);
+}
+
+sub putl {
+   ## Put ASCII string, converted to EBCDIC, onto output socket
+   ##   ETX is termination char unless explicitly given as second argument.
+   my $eom = $ETX;
+   $eom = $_[1] if $_[1];
+   $sock->send(
+      $SYN . $DLE . $STX . atoe($_[0]) . $DLE . $eom
+   );
+}
+
+sub puts8 {
+   ## Prefix ASCII string, converted to EBCDIC, with S-8 char and write to
+   ##   output socket.
+   ##   ETX is termination char unless explicitly given as second argument.
+   my $eom = $ETX;
+   $eom = $_[1] if $_[1];
+   $sock->send(
+       $SYN . $DLE . $STX . chr(0xe0) . atoe(pad($_[0],79)) . $DLE . $eom
+   );
+}
+
+sub putle {
+   ## Write raw EBCDIC byte stream to output socket.
+   ##   ETX is termination char unless explicitly given as second argument.
+   my $eom = $ETX;
+   $eom = $_[1] if $_[1];
+   $sock->send(
+      $SYN . $DLE . $STX . $_[0] . $DLE . $eom
+   );
+}
+
+my $n = 0;
+sub ack {
+   ## Wait for BSC handshake response to previous buffer sent to HASP.
+   ##   Returns ACK, ACK(xx) or NAK depending on outcome.  xx may be ENQ,RVI or EOT.
+   ##   Dumps raw byte stream received if parameter is nonzero.
+   my $dbg = 0;
+   $dbg = $_[0] if $_[0];
+   my $dat = '';
+CHR: while(1){
+      $dat = "";
+      $sock->recv($dat, 1);
+      die "***Disconnect" unless length($dat) > 0;
+      if ($dat eq $DLE) {
+         $dat = "";
+         $sock->recv($dat, 1);
+         die "***Disconnect" unless length($dat) > 0;
+         if ($dat eq chr(0x61)) {
+            $dat = $ACK0;
+         } elsif ($dat eq chr(0x70)) {
+            $dat = $ACK1;
+         } elsif ($dat eq chr(0x7c)) {
+            $dat = $RVI;
+         } elsif ($dat eq $DLE) {
+            $dat = $DLE;
+         } else {
+            printf "%3d: %2.2x\n", $n++, ord($DLE) if $dbg;
+         }
+      }
+      $dat = substr($dat,0,1);
+      printf "%3d: %2.2x\n", $n++, ord(substr($dat,0,1)) if $dbg;
+      die "**Disconnect (probable)" if chr(0x00) eq $dat;
+      last CHR if (
+         $dat eq $ACK0 || $dat eq $ACK1 ||
+         $dat eq $ENQ || $dat eq $RVI ||
+         $dat eq $NAK || $dat eq $EOT
+      );
+   };
+   return "ACK" if ($dat eq $ACK0 || $dat eq $ACK1);
+   return "ACK(ENQ)" if $dat eq $ENQ;
+   return "ACK(RVI)" if $dat eq $RVI;
+   return "NAK(EOT)" if $dat eq $EOT;
+   return "NAK";
+}
+
+my $m = 1;
+my $punch = 0;
+sub get {
+   ## Return BSC encoded print/punch buffer from HASP with BSC handshaking
+   ##   If returned buffer is length zero, then job is completed.
+   my ($rec, $cc) = $m == 1 ? (atoe('/ '),atoe('/')) : ('','');
+   my $xpr = 0;
+   my $xprs = $DLE . $SOH;
+   my $dbg = 0;
+   $dbg = $_[0] if $_[0];
+   my $ack = $DLE;
+   $ack .= chr(0x61) if $m % 2 == 0;
+   $ack .= chr(0x70) if $m % 2 == 1;
+CHR: while(1){
+      my ($ch,$dat) = ('','');
+      $sock->recv($dat, 1);
+      die "***Disconnect" unless length($dat) > 0;
+      $xpr = 1 if (length($rec) > 2) && substr($rec, 0, 2) eq $xprs;
+      printf " %2.2x\n", ord(substr($dat,0,1)) if $dbg;
+      next CHR if $dat eq $SYN && $xpr == 0;
+      next CHR if $dat eq $STX;
+      if ($dat eq $SOH) {
+         $ch = '';
+         $sock->recv($ch,1);
+         die "***Disconnect" unless length($ch) > 0;
+         if ($ch eq $ESC) {      ## Printer ID char & first line CC char
+            $sock->recv($ch,2);
+            die "***Disconnect" unless length($ch) > 0;
+            $cc = substr($ch,1,1);
+         } else {
+            $rec .= $ch;
+         }
+         next CHR;
+      }
+      if ($dat eq $IBC) {         ## End of line
+         $rec .= $NL unless $punch;
+         next CHR;
+      }
+      if ($dat eq $ESC) {
+         $sock->recv($cc,1);
+         die "***Disconnect" unless length($cc) > 0;
+         printf " %2.2x\n", ord(substr($cc,0,1)) if $dbg;
+         ($rec, $punch) = ('', 1) if $m == 1 && $cc eq chr(0xf4);
+         $rec .= $cc . $SP if not $punch;
+         next CHR;
+      }
+      $cc = $NUL if $dat eq $EOT;
+      last CHR if (
+         $dat eq $ETX || $dat eq $EOT || $dat eq $EOM || $dat eq $ETB 
+      );
+      $rec .= $dat;
+   }
+   if ($cc eq $NUL) {
+      $rec = '';
+   } else {
+      put($ack);
+      $rec =~ s/${DLE}(.)/$1/;
+      $m++;
+   }
+   return $punch ? $rec : etoa($rec);
+}
+
+#------------------------------------------------------------------------------
+# Send RJE job input to HASP
+
+$| = 1; # flush printf output
+my $resp;
+if ($mode eq 'SEND') {
+   put($SYN . $SYN . $SYN . $ENQ);  ## Set 2780 rotary dial to "TSM/TRSP"
+      $resp = ack();
+   puts8('$SIGNON ..... REMOTE1');
+      $resp = ack();
+   putle(deck($s8num));
+      $resp = ack();
+   puts8('$MESSAGE SUBMITTING JOB ' . $s8num);
+      $resp = ack();
+   while (<STDIN>) {
+      chomp;             ## take newline off end of input
+      putl(pad($_,80));  ## pad to card length and send
+      $resp = ack();
+   }
+   puts8('$SIGNOFF',$EOT);
+      $resp = ack();
+}
+
+#------------------------------------------------------------------------------
+# Receive RJE job output from HASP
+
+if ($mode eq 'RECV') {
+   my $ln = 0;
+   put($SYN . $SYN . $SYN . $DLE . $ACK0);  ## Set 2780 rotary dial to "REC"
+      $resp = ack($dbg,1);
+
+   do {
+      $resp = get($dbg);
+      if ($punch) {
+         print $pfile $resp or die "**Error writing card punch output file";
+         $punch += 1;
+      } elsif (length($resp) > 0) {
+         my $out = $resp;
+         while(length($out)){             ## buffer will have multiple output lines
+            if ($out =~ /^(.) (\N*)(\n|$)/) {
+               $out =~ s/^(.) (\N*)(\n|$)//;
+               my ($cc, $line) = ($1, $2);
+               if ($ccd) {
+                  ## Debug output to display each line's carriage control
+                  print "$cc $line\n";
+               } else {
+                  ## Process line and carriage control spacing
+                  for($cc){
+                     if (/\//){ $ln += 1; print "$line\n"; last }
+                     if (/S/) { $ln += 2; print "$line\n\n"; last }
+                     if (/T/) { $ln += 3; print "$line\n\n\n"; last }
+                     if (/[A-H]/) {
+                        ## CC tape skip to next punched channel
+                        my $n = $cct[$ln]{$cc} - $ln - 1;
+                        print "$line"; do {print "\n"} while($n--);
+                        $ln = $cct[$ln]{$cc}; last
+                     }
+                     print <STDERR>,"**Bad CC char: $cc (ignored)\n";
+                     $ln++; print "$line\n";
+                  }
+                  $ln -= 66 if $ln > 65;
+               }
+            } else {
+               ## Malformed output, must be some BSC protocol not handled right
+               my $tx = atoe(substr($out,0,3));
+               printf "**Bad line match: (%02x%02x%02x)%s\n",
+                  ord(substr($tx,0,1)),
+                  ord(substr($tx,1,1)),
+                  ord(substr($tx,2,1)),
+                  $resp;
+               $out = '';
+            }
+         }
+      }
+   } while (length($resp));
+   printf '**EBCDIC punched output produced (%d lines)\n',$punch-1 if $punch;
+}

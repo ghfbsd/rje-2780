@@ -68,8 +68,9 @@ carriage control in the print stream.
 References:
 -----------
 
-**Hardware:** [2780](http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/2780/GA27-3005-3-2780_Data_Terminal_Description_Aug71.pdf)
-**Hardware:** [2703](http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/2703/GA27-2703-1_2703_Transmission_Ctl_Component_Descr_May67.pdf)
+**Hardware:** [IBM 2780](http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/2780/GA27-3005-3-2780_Data_Terminal_Description_Aug71.pdf)
+
+**Hardware:** [IBM 2703](http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/2703/GA27-2703-1_2703_Transmission_Ctl_Component_Descr_May67.pdf)
 
 **Protocol:** [BSC](http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/datacomm/A27-3004-0_bisyncGenDescr.pdf)
 

@@ -1,5 +1,3 @@
-# rje-2780
-
 2780 RJE
 ========
 
@@ -28,6 +26,22 @@ receives a print file, converts it to ASCII, and prints it to the
 standard output.  If HASP has any punched card output, that can be
 diverted to a separate file in raw EBCDIC 80 byte records.
 
+HASP is a fairly general I/O spooling program used on various IBM
+360 and 370 OSes but also with MTS (the Michigan Terminal System;
+see https://en.wikipedia.org/wiki/Michigan_Terminal_System for a
+general description).  The HASP login procedure is slightly
+different for IBM OSes and may need to be modified for use with
+one of them (the job input deck would be vastly different).  See
+the technical references at the end for further information.
+
+The printer is assumed to be 66 lines long.  The BSC printer
+protocol includes carriage control characters with each output line,
+and the 2780 had carriage control tape which must be emulated
+properly for proper vertical spacing of printed output.  There is a
+built-in carriage control tape description that may be extended with
+straightforward changes to the code.
+
+
 ```
 
 usage: 2780-rje {-r | -s} [-h] [-# <n>] [-p <file>] [{-cc | -d}] <port>
@@ -50,3 +64,13 @@ carriage control in the print stream.
 -h prints this help.
 
 ```
+
+References:
+-----------
+
+*Hardware: [2780]http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/2780/GA27-3005-3-2780_Data_Terminal_Description_Aug71.pdf
+*Hardware: [2703]http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/2703/GA27-2703-1_2703_Transmission_Ctl_Component_Descr_May67.pdf
+
+*Protocol: [BSC]http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/datacomm/A27-3004-0_bisyncGenDescr.pdf
+
+*HASP: [360 version]http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/360/hasp/HASP_II_Manual_Jun72.pdf

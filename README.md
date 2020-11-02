@@ -75,3 +75,5 @@ References:
 **Protocol:** [BSC](http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/datacomm/A27-3004-0_bisyncGenDescr.pdf)
 
 **HASP:** [360 version](http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/360/hasp/HASP_II_Manual_Jun72.pdf)
+
+**MTS:** [on simulated IBM hardware](http://archive.michigan-terminal-system.org/documentation#TOC-MTS-Distributions)
